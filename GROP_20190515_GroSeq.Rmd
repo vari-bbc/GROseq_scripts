@@ -1,0 +1,944 @@
+---
+title: "GROP_20190515_GroSeq"
+author: "Ian Beddows"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: 
+  html_document:
+    self_contained: yes
+    toc: true
+    toc_depth: 5
+    toc_float: true
+    number_sections: false
+    df_print: paged
+    code_folding: hide
+    theme: yeti
+---
+Tested in R version `r getRversion()`.
+
+Using FDR filter of `r fdr.filter=0.05; fdr.filter`
+
+```{r setup}
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE,cache=TRUE,dev=c('png','postscript'),cache.lazy = FALSE)
+
+knitr::opts_knit$set(root.dir = '/Volumes/projects_secondary/bbc/research/GROP_20190515_GroSeq/')
+```
+
+```{r loadlibs}
+#Load in the libraries for differential expression
+library(ggplot2)
+library(biomaRt)
+library(reshape2)
+library(grid)
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(ggrepel)
+library(RColorBrewer)
+library(goseq)
+library(edgeR)
+library(DESeq2)
+library(pheatmap)
+library(ggalt)
+library(ggfortify)
+library(kableExtra)
+library(formattable)
+library(readxl)
+```
+
+```{r t2g_object,eval=FALSE,cache=TRUE}
+# Set the host:
+# mart <- biomaRt::useMart(biomart = 'ENSEMBL_MART_ENSEMBL')
+# View(listDatasets(mart))
+
+# mart <- biomaRt::useMart(biomart = 'ENSEMBL_MART_ENSEMBL', host="asia.ensembl.org",dataset = 'hsapiens_gene_ensembl',ensemblRedirect = FALSE) # usaeast
+# mart <- biomaRt::useMart(biomart = 'ENSEMBL_MART_ENSEMBL', host="usaeast.ensembl.org",dataset = 'hsapiens_gene_ensembl',ensemblRedirect = FALSE) # usaeast
+mart <- biomaRt::useMart(biomart = 'ENSEMBL_MART_ENSEMBL', dataset = 'hsapiens_gene_ensembl') # usaeast
+
+# View(listAttributes(mart))
+
+# t2g <- biomaRt::getBM(attributes = c("ensembl_gene_id", "external_gene_name", "description","chromosome_name","start_position","end_position","strand"), mart = mart)
+
+# write.table(t2g,'deliverables/hsapiens_gene_ensembl.txt',sep='\t',quote=FALSE,row.names = FALSE)
+
+# dim(t2g)
+
+# t2g <- dplyr::rename(t2g, ens_gene = ensembl_gene_id, ext_gene = external_gene_name, predicted_function = description)
+
+# t2g_no_dup_genes = t2g[-which(duplicated(t2g$ens_gene)),] # no duplicates
+
+
+# get exon data
+# grch38 <- biomaRt::useMart(biomart = 'ENSEMBL_MART_ENSEMBL', host="useast.ensembl.org",dataset = 'hsapiens_gene_ensembl') # gr38
+# View(biomaRt::listAttributes(mart))
+t2g_human_gr38_exon <- biomaRt::getBM(attributes = c("ensembl_gene_id","ensembl_transcript_id","chromosome_name","start_position","end_position", "external_gene_name","exon_chrom_start","exon_chrom_end","strand"), mart = mart) # get human data
+```
+
+#Results Summary
+
+*5/31/19 Results summary from the second data iteration (n=16)*:
+
+  * Adapter content was between 5 and 12% with an average of 8%. This is much lower than in the pilot data.
+  * There is a relatively low uniquely mapping rate and many less reads mapping to features (genes/lncRNAs etc.) than expected from normal RNAseq --- I think this is from more intronic reads in this dataset, an observation that would be in line with expectations.
+  * From a global perspective, there are no obvious consistent differences between groups for the distribution of reads. You can see a little peak 3' of the TSS in the CDK9 inhibited samples, but I don't know if this is significant (i.e. you don't see it in PHA rep A and you do see it in mithramyacin 20 rep C). It does look promising.
+  * There are also noticeable consistent trends in the data that I don't have an explanation for and would want to be investigated.
+  * Many of the genes that you are interested in have few reads mapped to them making it difficult to make statistical or biological conclusions.
+  * Because this is a new technique (for me and in general) there are not too many tools available. I would want to work more with this dataset (e.g. to quantify promoter transcription/eRNAs), but it would take time to do appropriately.
+  * For example, to examine eRNAs (and probably promoter expression too) we would need to implement a program such as this one (http://www.bioconductor.org/packages/release/bioc/html/groHMM.html). This is because you have to first find eRNAs using HMMs and then quantify/contrast them between groups. This is definitely doable, but, again, maybe not feasible on your timeline.
+
+*Results summary for pilot data (n=2)*:
+
+  * Following adapter trimming and polyA removal, 45.6 & 52.3% of reads are quality (given to the mapper).
+  * Adapter content:
+    * GROCTGF: TruSeq Adapter, Index 2 - >30% of the data
+    * GROPHGF: TruSeq Adapter, Index 6 - >30% of the data
+  * Mapping rate 92%.
+  * Uniq mapping rates of 68 & 72% for all reads:
+  * But many of these are duplicates:
+    * GROCTGF: Removed 511986 of 1659801 (30.85%) read ids as duplicates
+    * GROPHGF: Removed 1208549 of 2314725 (52.21%) read ids as duplicates
+  * Following duplicate removal, <20% raw reads uniquely mapped (usable for generating count data in RNAseq).
+  * Raw Feature Counts ~0.1 million for both samples. Most quality data has ~30 million counts (the feature cpm distribution is also low). **The input is low and not helped by adapter contamination.**
+  * **Distribution of read mapping distance from 5' supported hypothesis that sample PH has transcription blocked.**
+
+
+
+# Feature Counts
+
+```{r feature_counts}
+# Load STAR feature counts:
+raw.data.file='deliverables/joinedSTAR2pass.withheader.count.txt'
+raw_data = read.delim(raw.data.file, row.names = 1, stringsAsFactors = F, check.names = F,sep='\t')
+raw_data <- raw_data[,-ncol(raw_data)] #Removing a column of NAs presuming it's the last column
+# colnames(raw_data) %in% meta$sample
+# Library sizes are computed from the reads counts for mapped reads to gff features
+lib_sizes <- data.frame(colSums(raw_data)/1e6) # In millions
+lib_sizes$sample <- factor(rownames(lib_sizes))
+colnames(lib_sizes)[1] <- 'millions_of_counts'
+
+cat('Raw Feature Counts Summary (Millions):\n')
+summary(lib_sizes$millions_of_counts)
+
+knitr::kable(lib_sizes,caption='Raw Feature Counts') %>% kable_styling(bootstrap_options = c("striped", "hover","condensed"),font_size = 12)
+
+# 
+# ggplot(lib_sizes, aes(x = sample, y = millions_of_counts)) +
+#   geom_bar(stat="identity",fill='blue') +
+#   labs(caption=paste0('data: ',raw.data.file),y="Raw Counts (Millions)",title="Total Raw Read Counts For All Features") +
+#   theme_bw(10) +
+#   theme(
+#     axis.text.x = element_text(angle=45, hjust=1),
+#     axis.title.x = element_blank(),
+#     plot.title = element_text(hjust = 0.5)
+#   )
+# 
+# cat("Total tags:\n",nrow(raw_data))
+# cat("Total tags with >0 counts:\n",nrow(raw_data[rowSums(raw_data) >= 1,]))
+# 
+# # Filter 1
+# cat('Filter 1\n')
+# sample.cpm.filter=1
+# cpm.filter=10 # feature cpm
+# cat('Filters:\nminimum',cpm.filter,'cpm in ',sample.cpm.filter,'sample\n')
+# filtered.data = raw_data[rowSums(cpm(as.matrix(raw_data)) > cpm.filter) >= sample.cpm.filter,]
+# cat("Filtered tags:\n",nrow(filtered.data))
+# tidyr::gather(filtered.data,sample,count) %>% ggplot(aes(count)) + geom_histogram(binwidth=1) + xlim(c(0,25)) + facet_grid(sample ~ .) + ylim(c(0,5000)) + ggtitle('Filtered Data Gene Count Histogram')
+# 
+# 
+# # Filter 2
+# cat('Filter 2\n')
+# sample.cpm.filter=1
+# cpm.filter=100
+# cat('Filters:\nminimum',cpm.filter,'cpm in ',sample.cpm.filter,'sample\n')
+# filtered.data = raw_data[rowSums(cpm(as.matrix(raw_data)) > cpm.filter) >= sample.cpm.filter,]
+# cat("Filtered tags:\n",nrow(filtered.data))
+# tidyr::gather(filtered.data,sample,count) %>% ggplot(aes(count)) + geom_histogram(binwidth=1) + xlim(c(0,200)) + facet_grid(sample ~ .) + ylim(c(0,250)) + ggtitle('Filtered Data Gene Count Histogram')
+
+```
+
+# Mapstats
+
+```{r mapping_stats_RNAseq,eval=TRUE,fig.height=8,fig.width=8}
+
+meta = read.delim('deliverables/MetaData.txt',sep='\t')
+meta$genotype=meta$group
+# For usage with this bash code:
+# if [ ! -f ${DIR}/deliverables/UniquelyMappingRates.txt ]; then
+# echo "Generating Mapstats"
+# echo "sample	UniquelyMappingRates" > ${DIR}/deliverables/UniquelyMappingRates.txt
+# echo "sample	UniquelyMappingReads" > ${DIR}/deliverables/UniquelyMappingReads.txt
+# grep 'Uniquely mapped reads %' ${ANALYSIS}*Log.final.out |cut -d ' ' -f1,29|awk -F 'Log.final.out: \\|' '{print $1$2}' >> ${DIR}/deliverables/UniquelyMappingRates.txt
+# grep 'Uniquely mapped reads number' ${ANALYSIS}*Log.final.out |cut -d ' ' -f1,24|awk -F 'Log.final.out: \\|' '{print $1$2}' >> ${DIR}/deliverables/UniquelyMappingReads.txt
+# fi
+
+  mapstat = read.delim("deliverables/UniquelyMappingRates.txt",sep='\t',header=TRUE,stringsAsFactors = F)
+  # colnames(mapstat)=c('sample','UniquelyMappingRate')
+  mapstat$sample=gsub(".*/","",mapstat$sample)
+  mapstat$UniquelyMappingRates=as.numeric(gsub('%','',mapstat$UniquelyMappingRates))
+  as.character(mapstat$sample)%in%as.character(meta$sample)
+  mapstat$sample=factor(mapstat$sample,levels=meta$sample)
+  mapstat = dplyr::left_join(mapstat,meta)
+  mapstat = dplyr::filter(mapstat,!is.na(sample))
+  
+  ggplot(mapstat,aes(x=sample,y=UniquelyMappingRates,fill=genotype)) + 
+    labs(title=paste('Mapping Stats - Uniquely Mapping Percentage'),subtitle='',caption='Data: UniquelyMappingRate.txt') +
+    scale_color_brewer('Set1') + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1,size=8)) + 
+    geom_bar(stat="identity",position='stack') + labs(y='Uniquely Mapping Percentage',x='Sample') #+
+    # facet_grid(genotype~.)
+
+rates = mapstat$UniquelyMappingRates
+  
+mapstat = read.delim("deliverables/UniquelyMappingReads.txt",sep='\t',header=TRUE,stringsAsFactors = F)
+mapstat$sample=gsub(".*/","",mapstat$sample)
+mapstat = dplyr::left_join(mapstat,meta)
+mapstat = dplyr::filter(mapstat,!is.na(genotype))
+
+# ggplot(mapstat,aes(UniquelyMappingReads)) + geom_histogram() #+ facet_grid(genotype~.)
+
+ggplot(mapstat,aes(x=sample,y=UniquelyMappingReads,fill=genotype)) + 
+    labs(title=paste('Mapping Stats - Uniquely Mapping Reads'),subtitle='',caption='Data: UniquelyMappingReads.txt') +
+    scale_color_brewer('Set1') + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1,size=8)) + 
+    geom_bar(stat="identity",position='stack') + labs(y='Uniquely Mapping Reads',x='Sample') #+
+    # facet_grid(genotype~.)
+
+mapstat$rates=rates
+
+# mapstat %>% ggplot(aes(UniquelyMappingReads)) + geom_histogram() + ggtitle('Histogram - Uniquely Mapping Reads')
+
+```
+
+# Global
+
+```{r get_gtf_for_BestList,eval=FALSE}
+# read in bestlist
+bestlist = read.delim('/Volumes/projects_secondary/bbc/research/GROP_20180925_RNA/data_files/BESTLIST_forGuillermo.gmx',sep='\t',skip=1)
+colnames(bestlist)='ext_gene'
+# include some additional genes added later
+induced_repressed=read.delim('deliverables/induced_repressed.gmx',sep='\t',skip=0)
+colnames(induced_repressed)='ext_gene'
+# generate final bestlist
+bestlist=rbind(bestlist,induced_repressed)
+# join annotation
+genes = dplyr::left_join(bestlist,t2g_human_gr38_exon,by=c('ext_gene'='external_gene_name'))
+# length(unique(genes$ext_gene)) # 113
+# dim(genes) # 8641 9
+
+# get longest possible isoform +/- 5000 bp
+data = genes %>% group_by(ext_gene,ensembl_gene_id) %>% summarise(exon_start=min(exon_chrom_start)-5000,exon_end=max(exon_chrom_end)+5000)
+
+# calculate max isoform distance
+data$distance = data$exon_end-data$exon_start
+
+# join rest of annotation
+data2join = dplyr::select(t2g_human_gr38_exon,one_of(c('external_gene_name','ensembl_gene_id','strand','chromosome_name'))) %>% rename('external_gene_name'='ext_gene')
+data2join=data2join[-which(duplicated(data2join)),]
+data = left_join(data,data2join,by=c('ext_gene','ensembl_gene_id'))
+
+# housekeeping
+data$chromosome_name=ifelse(data$chromosome_name=='X',data$chromosome_name,as.numeric(data$chromosome_name))
+data = na.omit(data)
+
+# write this table
+write.table(data,'bestlist_data_for_file_creation.txt',quote = F, sep = "\t", row.names = F, col.names = T)
+
+# now we have all we need for the linux command: - HOWEVER THIS STRATEGY DOESN'T WORK - INSTEAD, WE WILL USE PERL TO PARSE THE FILE AND REPORT ALL POSITIONS IN AN ALREADY PROPERLY FORMATTED FILE FOR PLOTTING
+# tail -n+2 bestlist_data_for_file_creation.txt |cut -f3,5,7,1|awk -F ' ' '{print "grep -A"$3,"-P \""$4"\\t"$2"\" deliverables/depth_of_coverage.filtered.txt > bestlist_coverage_files/"$1".txt"}'|sh ## THIS NOT WORKING
+
+# The working command:
+# perl src/get_region_from_depthfile.pl -region_file bestlist_data_for_file_creation.txt -depth_file deliverables/depth_of_coverage.filtered.txt -outfile bestlist_depth.txt
+
+```
+
+```{r get_gtf_for_Induced_Repressed_List,eval=FALSE}
+# read in bestlist
+induced = readxl::read_excel('/Volumes/projects_secondary/bbc/research/GROP_20190515_GroSeq/deliverables/EWS-FLI1 Induced & Repressed BESTLISTS.xlsx',sheet='Induced')
+repressed = readxl::read_excel('/Volumes/projects_secondary/bbc/research/GROP_20190515_GroSeq/deliverables/EWS-FLI1 Induced & Repressed BESTLISTS.xlsx',sheet='Repressed')
+bestlist=rbind(induced,repressed)
+
+# join annotation
+genes = dplyr::left_join(bestlist,t2g_human_gr38_exon,by=c('ext_gene'='external_gene_name'))
+# length(unique(genes$ext_gene)) # 113
+# dim(genes) # 8641 9
+
+# get longest possible isoform +/- 5000 bp
+data = genes %>% group_by(ext_gene,ensembl_gene_id) %>% summarise(exon_start=min(exon_chrom_start)-5000,exon_end=max(exon_chrom_end)+5000)
+
+# calculate max isoform distance
+data$distance = data$exon_end-data$exon_start
+
+# join rest of annotation
+data2join = dplyr::select(t2g_human_gr38_exon,one_of(c('external_gene_name','ensembl_gene_id','strand','chromosome_name'))) %>% rename('external_gene_name'='ext_gene')
+data2join=data2join[-which(duplicated(data2join)),]
+data = left_join(data,data2join,by=c('ext_gene','ensembl_gene_id'))
+
+# housekeeping
+data$chromosome_name=ifelse(data$chromosome_name=='X',data$chromosome_name,as.numeric(data$chromosome_name))
+data = na.omit(data)
+
+# write this table
+write.table(data,'induced_repressed_data_for_file_creation.txt',quote = F, sep = "\t", row.names = F, col.names = T)
+
+# The working command:
+# perl src/get_region_from_depthfile.pl -region_file induced_repressed_data_for_file_creation.txt -depth_file deliverables/depth_of_coverage.filtered.txt -outfile induced_repressed_depth.txt
+
+```
+
+```{r get_gtf_for_Induced_Repressed_List_IncludingUpdates,eval=FALSE}
+# read in bestlist
+induced = readxl::read_excel('/Volumes/projects_secondary/bbc/research/GROP_20190515_GroSeq/deliverables/EWS-FLI1 Induced & Repressed BESTLISTS.xlsx',sheet='Induced')
+repressed = readxl::read_excel('/Volumes/projects_secondary/bbc/research/GROP_20190515_GroSeq/deliverables/EWS-FLI1 Induced & Repressed BESTLISTS.xlsx',sheet='Repressed')
+bestlist=rbind(induced,repressed)
+# add some additional genes:
+additional=data.frame(
+  ext_gene=c('PADI2', 'RUNX3', 'JAK1', 'PTGER3', 'HIPK1', 'UAP1', 'RGL1', 'LAMB3', 'KMO', 'ID2','FCGRT', 'SLC17A7', 'AHCY', 'NKX2-2', 'GLG1', 'CDH11', 'GLCE', 'RCOR1','FLRT2', 'PCDH17')
+)
+bestlist=rbind(bestlist,additional)
+               
+# join annotation
+genes = dplyr::left_join(bestlist,t2g_human_gr38_exon,by=c('ext_gene'='external_gene_name'))
+# length(unique(genes$ext_gene)) # 113
+# dim(genes) # 8641 9
+
+# get longest possible isoform +50000 / - 50000 bp
+data = genes %>% group_by(ext_gene,ensembl_gene_id) %>% summarise(exon_start=min(exon_chrom_start)-50000,exon_end=max(exon_chrom_end)+50000)
+
+# calculate max isoform distance + 100kb
+data$distance = data$exon_end-data$exon_start
+
+# join rest of annotation
+data2join = dplyr::select(t2g_human_gr38_exon,one_of(c('external_gene_name','ensembl_gene_id','strand','chromosome_name'))) %>% rename('external_gene_name'='ext_gene')
+data2join=data2join[-which(duplicated(data2join)),]
+data = left_join(data,data2join,by=c('ext_gene','ensembl_gene_id'))
+
+# housekeeping
+data$chromosome_name=ifelse(data$chromosome_name=='X',data$chromosome_name,as.numeric(data$chromosome_name))
+data = na.omit(data)
+
+# write this table
+write.table(data,'induced_repressed_data_for_file_creation_updated.txt',quote = F, sep = "\t", row.names = F, col.names = T)
+
+# The working command:
+# perl src/get_region_from_depthfile.pl -region_file induced_repressed_data_for_file_creation_updated.txt -depth_file deliverables/depth_of_coverage.filtered.txt -outfile induced_repressed_depth_updated.txt
+
+```
+
+<!-- this is the original with proportion normalized -->
+```{r global_prep_data0,eval=FALSE }
+# Load data
+file='Depth_from_TSS_plusMinus_SamplesEdited.txt'
+data = read.delim(file,sep='\t',stringsAsFactors = F)
+data$distance_from_TSS=as.numeric(data$distance_from_TSS)
+data=data[-which(is.na(data$distance_from_TSS)),]
+
+# data2=data.frame(
+#   distance_from_TSS=data$distance_from_TSS,
+#   solvent=rowSums(data[,c('GFGROSolA','GFGROSolB','GFGROSolC')]),
+#   pha=rowSums(data[,c('GFGROPHAA','GFGROPHAB','GFGROPHAC')]),
+#   combo=rowSums(data[,c('GFGROComA','GFGROComB','GFGROComC')]),
+#   mm20=rowSums(data[,c('GFGRO20A','GFGRO20B','GFGRO20C')]),
+#   mm100=rowSums(data[,c('GFGRO100A','GFGRO100B','GFGRO100C')])
+# )
+
+data=data[1:1e5,]  # only positions -2k to 98k
+data.notnorm = data # save unnormalized data
+
+# Normalize the data
+d2 = data.frame(t(apply(data[,2:16], 1, "/", colSums(data[,2:16]))))
+data = cbind(data.frame(data[,1]),d2)
+colnames(data)[1]='distance_from_TSS'
+
+
+
+# Exlcude - NOT POSSIBLE BECAUSE NO GENE INFO
+# data=data[-which(data$ext_gene%in%unique(genes$ext_gene)),]
+
+
+
+# data3 = data2[sample.int(nrow(data2),1000),]
+# plot(data$distance_from_TSS,data$GFGROComA,xlim=c(0,96e5))
+
+td = tidyr::gather(data,sample,proportion,-distance_from_TSS)
+td = dplyr::left_join(td,meta,by='sample')
+td.notnorm = tidyr::gather(data.notnorm,sample,proportion,-distance_from_TSS)
+td.notnorm = dplyr::left_join(td.notnorm,meta,by='sample')
+
+# ggplot(td,aes(x=distance_from_TSS,y=count,group=sample,color=sample)) + geom_line() + xlim(-2000,5000)
+ggplot(td,aes(x=distance_from_TSS,y=proportion,group=sample,color=group)) + geom_line() + xlim(-2000,5000)
+# ggplot(td,aes(x=distance_from_TSS,y=proportion,group=sample,color=group)) + geom_line() + xlim(-100,100)
+ggplot(td,aes(x=distance_from_TSS,y=proportion,group=sample,color=group)) + geom_line() + xlim(-750,200)
+
+# g0 = ggplot(td,aes(x=distance_from_TSS,y=proportion,group=sample,color=group)) + geom_smooth(se=F) +
+#   xlim(-2000,5000) + xlab('Distance from Transcription Start Site') + 
+#   ylab('Proportion of Reads') + 
+#   ggtitle('Whole Transcriptome Average Normalized')
+# g0
+# g0 %+% td.notnorm + ggtitle('Whole Transcriptome Average Not Normalized') + ylab('Reads')
+# 
+# ggplot(td,aes(x=distance_from_TSS,y=proportion,group=sample,color=group)) + geom_line() + facet_wrap(~sample) + xlim(-2000,5000)
+# 
+# ggplot(td,aes(x=distance_from_TSS,y=proportion,group=sample,fill=sample)) + geom_line() + xlim(-2000,5000) + facet_wrap(~group)
+# 
+# ggplot(td,aes(x=distance_from_TSS,y=proportion,group=sample,fill=group)) + geom_bar(stat='identity') + xlim(-2000,5000) + facet_wrap(~group)
+# 
+# ggplot(td,aes(x=distance_from_TSS,y=proportion,group=sample,fill=group)) + geom_bar(stat='identity') + xlim(-2000,5000) + facet_wrap(~group+sample)
+# ggplot(td,aes(x=distance_from_TSS,y=count)) + geom_bar(stat='identity') 
+
+```
+
+```{r global_prep_data,eval=TRUE }
+# Load data
+file='Depth_from_TSS_plusMinus_SamplesEdited.txt'
+data = read.delim(file,sep='\t',stringsAsFactors = F)
+data=data[1:1e5,]  # only positions -2k to 98k
+data$distance_from_TSS=as.numeric(data$distance_from_TSS)
+data=data[-which(is.na(data$distance_from_TSS)),]
+
+
+# data.notnorm = data # save unnormalized data
+
+## Library size normalize:
+mapstat$sample==colnames(data)
+mapstat$sample[order(match(mapstat$sample,colnames(data)[2:16]))]==colnames(data)[2:16]
+scaling.factor = mapstat$UniquelyMappingReads[order(match(mapstat$sample,colnames(data)[2:16]))]
+scaling.factor = scaling.factor/2e7 # 
+norm.df.no.tss = data.frame(t(apply(data[,2:16], 1, "/",scaling.factor)))
+norm.df = cbind(data[,1],norm.df.no.tss)
+colnames(norm.df)[1]='distance_from_TSS'
+
+td = tidyr::gather(norm.df,sample,normalized.reads,-distance_from_TSS)
+td = dplyr::left_join(td,meta,by='sample')
+```
+
+```{r global}
+g0 = ggplot(td,aes(x=distance_from_TSS,y=normalized.reads,group=sample,color=group)) + geom_smooth(se=F) + xlab('Distance from Transcription Start Site') + ylab('Normalized Reads') + ggtitle('Global')
+g = ggplot(td,aes(x=distance_from_TSS,y=normalized.reads,group=sample,color=group)) + geom_line() + xlab('Distance from Transcription Start Site') + ylab('Normalized Reads') + ggtitle('Global')
+
+g0 +  xlim(-2000,5000) 
+g0 +  xlim(-200,200) 
+
+g +  xlim(-2000,5000) 
+g +  xlim(-200,200) 
+
+
+```
+
+<!-- # EZH2 Coverage -->
+
+<!-- Created the EZH2 file with: -->
+<!-- grep -A80781 -P "7\t148805384" depth_of_coverage.filtered.txt > EZH2_coverage.txt -->
+<!-- head -1 depth_of_coverage.filtered.txt > header.txt -->
+<!-- cat header.txt EZH2_coverage.txt > EZH2_coverage.withheader.txt -->
+
+```{r EZH2_coverage,eval=FALSE}
+
+# ezh2 = dplyr::filter(t2g_human_gr38_exon,external_gene_name=='EZH2')
+ezh2 = dplyr::filter(t2g_human_gr38_exon,external_gene_name=='EZH2' & ensembl_transcript_id=='ENST00000483967')
+# dim(ezh2)
+
+.df = read.delim('deliverables/EZH2_coverage.withheader.txt',sep='\t',header=TRUE)
+# normalize the df by sample
+df = data.frame(t(apply(.df[,3:17], 1, "/", colSums(.df[,3:17]))))
+df = cbind(.df[,1:2],df)
+tdf = tidyr::gather(df,sample,depth,-chr,-pos)
+tdf = dplyr::left_join(tdf,meta,by='sample')
+
+# 100 bp +/- TSS
+# ggplot(tdf,aes(x=pos,y=depth,group=sample,fill=group,color=group)) + geom_line() + xlim(c(148884064,148884264)) + ylim(c(0,80)) #geom_bar(stat='identity') #+ facet_wrap(~group)
+
+
+# code from 10x project:
+
+g = ggplot(tdf) + geom_smooth(aes(x=pos,y=depth,color=group,group=group)) + ggtitle('EZH2 GroSeq Coverage') + xlab('Chr 7 Position')
+ggplot(tdf) + geom_smooth(aes(x=pos,y=depth,color=group,group=sample)) + ggtitle('EZH2 GroSeq Coverage') + xlab('Chr 7 Position')
+g2 = ggplot(tdf) + geom_line(aes(x=pos,y=depth,color=group,group=group)) + ggtitle('EZH2 GroSeq Coverage') + xlab('Chr 7 Position')
+
+g + geom_rect(data = ezh2,mapping=aes(fill=ensembl_transcript_id,xmin=exon_chrom_start, xmax=exon_chrom_end, ymin=0, ymax=0.25e-05)) +  theme(axis.text.x = element_text(angle = 45, hjust = 1,size=8))
+# g2 + geom_rect(data = ezh2,mapping=aes(fill=ensembl_transcript_id,xmin=exon_chrom_start, xmax=exon_chrom_end, ymin=-10, ymax=0)) +  theme(axis.text.x = element_text(angle = 45, hjust = 1,size=8))
+
+pha = dplyr::filter(tdf,sample%in%c('GFGROPHAA','GFGROPHAB','GFGROPHAC'))
+mm100 = dplyr::filter(tdf,sample%in%c('GFGRO100A','GFGRO100B','GFGRO100C'))
+combo = dplyr::filter(tdf,sample%in%c('GFGROComA','GFGROComB','GFGROComC'))
+g2 %+% pha
+g2 %+% mm100 + geom_rect(data = ezh2,mapping=aes(fill=ensembl_transcript_id,xmin=exon_chrom_start, xmax=exon_chrom_end, ymin=-0.25e-05, ymax=0)) +  theme(axis.text.x = element_text(angle = 45, hjust = 1,size=8)) + xlim(c(148873664,148894664)) + geom_vline(xintercept = 148883664) + geom_vline(xintercept = 148884664)
+
+g2 %+% combo + geom_rect(data = ezh2,mapping=aes(fill=ensembl_transcript_id,xmin=exon_chrom_start, xmax=exon_chrom_end, ymin=-0.25e-05, ymax=0)) +  theme(axis.text.x = element_text(angle = 45, hjust = 1,size=8)) + xlim(c(148873664,148894664)) + geom_vline(xintercept = 148883664) + geom_vline(xintercept = 148884664)
+```
+
+<!-- # EWS-FLI1_Targets -->
+<!-- this is normalized to the proportion of reads at a postions within a library -->
+```{r prep_Bestlist_depth_data_for_figures,eval=FALSE}
+
+# get the data and manually add sample names:
+.df = read.delim('bestlist_depth.txt',sep='\t',header=FALSE,stringsAsFactors = FALSE)
+colnames(.df)=c('ext_gene','genome_position','distance_from_TSS','GFGRO100A',	'GFGRO100B',	'GFGRO100C',	'GFGRO20A',	'GFGRO20B',	'GFGROPHAA',	'GFGROComA',	'GFGROComB',	'GFGROComC',	'GFGRO20C',	'GFGROPHAB',	'GFGROPHAC',	'GFGROSolA',	'GFGROSolB',	'GFGROSolC')
+n.targets = length(unique(.df$ext_gene))
+
+# get normalized to total reads mapped dataset
+norm.df = data.frame(t(apply(.df[,4:18], 1, "/", colSums(.df[,4:18],na.rm=TRUE))))
+norm.df = cbind(.df[,1:3],norm.df)
+colnames(norm.df)=c('ext_gene','genome_position','distance_from_TSS','GFGRO100A',	'GFGRO100B',	'GFGRO100C',	'GFGRO20A',	'GFGRO20B',	'GFGROPHAA',	'GFGROComA',	'GFGROComB',	'GFGROComC',	'GFGRO20C',	'GFGROPHAB',	'GFGROPHAC',	'GFGROSolA',	'GFGROSolB',	'GFGROSolC')
+
+# get tidy not normalized data full dataset
+tdf.notnorm = tidyr::gather(.df,sample,depth,-genome_position,-distance_from_TSS,-ext_gene)
+# get count sums
+tdf.notnorm = tdf.notnorm %>% group_by(distance_from_TSS,sample) %>% summarize(depth_sum=sum(depth))
+tdf.notnorm = left_join(tdf.notnorm,meta,by='sample')
+# tdf.notnorm = sample_frac(tdf.notnorm,size=0.02) # downsample if too slow
+
+# get tidy normalized data full dataset
+tdf.norm = tidyr::gather(norm.df,sample,depth,-genome_position,-distance_from_TSS,-ext_gene)
+tdf.norm = tdf.norm %>% group_by(distance_from_TSS,sample) %>% summarize(depth_sum=sum(depth))
+# tdf.norm = sample_frac(tdf.norm,size=0.02) # downsample if too slow
+tdf.norm = left_join(tdf.norm,meta,by='sample')
+
+
+# get a subset for repressed and induced
+.induced = read.delim('deliverables/Induced_seq.csv',sep=',')
+induced = .induced$ext_gene
+# induced = c('SLC17A7', 'FCGRT', 'AHCY', 'NKX2-2', 'PPP2R2A', 'RUNX3', 'MYC', 'NR0B1', 'EZH2', 'FLI1', 'SMARCC1', 'CCND1', 'FAM49A')
+# repressed = c('RMS3', 'BCAR3', 'S100A10','COL6A1', 'BMP7', 'PHLDA1')
+.repressed = read.delim('deliverables/Repressed_seq.csv',sep=',')
+repressed = .repressed$ext_gene
+# which(repressed %in% norm.df$ext_gene)
+
+# get tidy normalized induced
+norm.induced=dplyr::filter(norm.df,ext_gene %in% induced)
+n.induced=length(unique(norm.induced$ext_gene))
+tdf.norm.induced = tidyr::gather(norm.induced,sample,depth,-genome_position,-distance_from_TSS,-ext_gene)
+tdf.norm.induced = tdf.norm.induced %>% group_by(distance_from_TSS,sample) %>% summarize(depth_sum=sum(depth))
+tdf.norm.induced = left_join(tdf.norm.induced,meta,by='sample')
+
+# get tidy normalized repressed
+norm.repressed=dplyr::filter(norm.df,ext_gene %in% repressed)
+n.repressed=length(unique(norm.repressed$ext_gene)) # 5, RMS3 not found
+tdf.norm.repressed = tidyr::gather(norm.repressed,sample,depth,-genome_position,-distance_from_TSS,-ext_gene)
+tdf.norm.repressed = tdf.norm.repressed %>% group_by(distance_from_TSS,sample) %>% summarize(depth_sum=sum(depth))
+tdf.norm.repressed = left_join(tdf.norm.repressed,meta,by='sample')
+
+```
+
+<!-- generate plots! -->
+```{r EWS-FLI1_Targets,eval=FALSE }
+
+# line plot
+g = ggplot(tdf.norm) + geom_line(aes(x=distance_from_TSS,y=depth_sum,color=group,group=sample)) + ggtitle(paste(n.targets,'EWS-FLI1 Targets - Normalized')) + xlim(c(-2000,5000)) + ylab('proportion of reads')
+g 
+# g +  coord_cartesian(xlim=c(-200,200))
+g +  coord_cartesian(xlim=c(-750,200))
+
+# Repressed
+g %+% tdf.norm.repressed + ggtitle(paste(n.repressed,' Repressed EWS-FLI1 Targets Normalized'))
+g %+% tdf.norm.repressed + ggtitle(paste(n.repressed,' Repressed EWS-FLI1 Targets Normalized'))  + coord_cartesian(xlim=c(-750,200))
+
+# Induced
+g %+% tdf.norm.induced + ggtitle(paste(n.induced,' Induced EWS-FLI1 Targets Normalized'))
+g %+% tdf.norm.induced + ggtitle(paste(n.induced,' Induced EWS-FLI1 Targets Normalized'))  + coord_cartesian(xlim=c(-750,200))
+
+
+
+
+
+# g %+% tdf.notnorm + ggtitle(paste(n.targets,'EWS-FLI1 Targets Average Not Normalized'))
+# g %+% tdf.notnorm + ggtitle(paste(n.targets,'EWS-FLI1 Targets Average Not Normalized')) + coord_cartesian(xlim=c(-200,200))
+# 
+# 
+# # geom smooth
+# g2 = ggplot(tdf) + geom_smooth(aes(x=distance_from_TSS,y=depth_sum,color=group,group=sample),se=F) +
+#   ggtitle(paste(n.targets,'EWS-FLI1 Targets Average Normalized')) + ylab('Proportion of Reads') +
+#   xlab('Distance from Transcription Start Site') + xlim(c(-2000,5000))
+# g2
+
+
+
+
+
+# 
+# 
+# ggplot(tdf.notnorm) + geom_smooth(aes(x=distance_from_TSS,y=depth_sum,color=group,group=sample),se=F) +
+#   ggtitle(paste(n.targets,'EWS-FLI1 Targets Average Not Normalized')) +
+#   ylab('Reads') + xlim(c(-2000,5000))
+# 
+# cat(paste(unique(tdf$ext_gene),collapse="\n"))
+
+# g2 + coord_cartesian(xlim=c(-5000,5000))
+
+
+# Housekeeping: GAPDH
+
+# ggplot(tdf) + geom_smooth(aes(x=distance_from_TSS,y=depth,color=group,group=group)) + ggtitle('Bestlist GroSeq Coverage') + xlim(c(-5000,5000)) #coord_cartesian(xlim=c(-5000,5000))
+
+
+# g2 %+% filter(tdf,ext_gene=='EZH2') + ggtitle('ezh2')
+# g2 %+% filter(tdf,ext_gene=='MYC') + ggtitle('MYC') + xlim(c(-5000,5000))
+# g %+% filter(tdf,ext_gene=='NR0B1') + ggtitle('nr0b1') + xlim(c(-5000,5000)) #+ geom_rect(data = nr0b1,mapping=aes(xmin=exon_chrom_start, xmax=exon_chrom_end, ymin=-25, ymax=0))
+# 
+# g2 %+% filter(tdf,ext_gene=='EZH2') + ggtitle('ezh2') + xlim(c(-5000,5000))
+# g2 %+% filter(tdf,ext_gene%in%induced) + ggtitle('Induced') + xlim(c(-5000,5000))
+# g2 %+% filter(tdf,ext_gene%in%repressed) + ggtitle('Repressed')
+# 
+# g2 %+% filter(tdf,ext_gene=='NR0B1') + ggtitle('nr0b1') + xlim(c(-5000,5000))
+# g2 %+% filter(tdf.notnorm,ext_gene=='NR0B1') + ggtitle('nr0b1') + xlim(c(-5000,5000))
+# .nr0b1 = filter(.df,ext_gene=='NR0B1')
+# nr0b1 = data.frame(t(apply(.nr0b1[,4:18], 1, "/", colSums(.nr0b1[,4:18],na.rm=TRUE))))
+# nr0b1 = cbind(.nr0b1[,1:3],nr0b1)
+# nr0b1 = tidyr::gather(nr0b1,sample,depth,-genome_position,-distance_from_TSS,-ext_gene)
+# nr0b1 = left_join(nr0b1,meta,by='sample')
+# g %+% nr0b1 + ggtitle('NR0B1') + facet_wrap(~group)
+# 
+# g2 %+% sample_frac(tdf,size=0.01) 
+
+```
+
+<!-- # EWS-FLI1 Induced Repressed -->
+<!-- these are again the proportion normalized and not what is wanted at the end -->
+```{r prep_InducedRepressed_depth_data_for_figures,eval=FALSE}
+
+# get the data and manually add sample names:
+.df = read.delim('induced_repressed_data_for_file_creation_updated.txt',sep='\t',header=FALSE,stringsAsFactors = FALSE)
+colnames(.df)=c('ext_gene','genome_position','distance_from_TSS','GFGRO100A',	'GFGRO100B',	'GFGRO100C',	'GFGRO20A',	'GFGRO20B',	'GFGROPHAA',	'GFGROComA',	'GFGROComB',	'GFGROComC',	'GFGRO20C',	'GFGROPHAB',	'GFGROPHAC',	'GFGROSolA',	'GFGROSolB',	'GFGROSolC')
+n.targets = length(unique(.df$ext_gene))
+
+# get normalized to total reads mapped dataset
+norm.df = data.frame(t(apply(.df[,4:18], 1, "/", colSums(.df[,4:18],na.rm=TRUE))))
+norm.df = cbind(.df[,1:3],norm.df)
+colnames(norm.df)=c('ext_gene','genome_position','distance_from_TSS','GFGRO100A',	'GFGRO100B',	'GFGRO100C',	'GFGRO20A',	'GFGRO20B',	'GFGROPHAA',	'GFGROComA',	'GFGROComB',	'GFGROComC',	'GFGRO20C',	'GFGROPHAB',	'GFGROPHAC',	'GFGROSolA',	'GFGROSolB',	'GFGROSolC')
+
+
+
+### Get induced / repressed lists:
+induced.genes = readxl::read_excel('/Volumes/projects_secondary/bbc/research/GROP_20190515_GroSeq/deliverables/EWS-FLI1 Induced & Repressed BESTLISTS.xlsx',sheet='Induced')
+repressed.genes = readxl::read_excel('/Volumes/projects_secondary/bbc/research/GROP_20190515_GroSeq/deliverables/EWS-FLI1 Induced & Repressed BESTLISTS.xlsx',sheet='Repressed')
+
+induced = induced.genes$ext_gene
+repressed = repressed.genes$ext_gene
+# which(repressed %in% norm.df$ext_gene)
+
+# get tidy normalized induced
+norm.induced=dplyr::filter(norm.df,ext_gene %in% induced)
+n.induced=length(unique(norm.induced$ext_gene))
+tdf.norm.induced = tidyr::gather(norm.induced,sample,depth,-genome_position,-distance_from_TSS,-ext_gene)
+tdf.norm.induced = tdf.norm.induced %>% group_by(distance_from_TSS,sample) %>% summarize(depth_sum=sum(depth))
+tdf.norm.induced = left_join(tdf.norm.induced,meta,by='sample')
+
+# get tidy normalized repressed
+norm.repressed=dplyr::filter(norm.df,ext_gene %in% repressed)
+n.repressed=length(unique(norm.repressed$ext_gene)) # 5, RMS3 not found
+tdf.norm.repressed = tidyr::gather(norm.repressed,sample,depth,-genome_position,-distance_from_TSS,-ext_gene)
+tdf.norm.repressed = tdf.norm.repressed %>% group_by(distance_from_TSS,sample) %>% summarize(depth_sum=sum(depth))
+tdf.norm.repressed = left_join(tdf.norm.repressed,meta,by='sample')
+
+```
+
+```{r EWS-FLI1_InducedRepressed,eval=FALSE }
+
+# Repressed
+g = ggplot(tdf.norm.repressed) + geom_line(aes(x=distance_from_TSS,y=depth_sum,color=group,group=sample)) + ggtitle(paste(n.repressed,' Repressed EWS-FLI1 Targets Normalized')) + xlim(c(-50000,200000)) + ylab('proportion of reads')
+g
+g %+% tdf.norm.induced + ggtitle(paste(n.induced,' Induced EWS-FLI1 Targets Normalized'))
+
+#
+# ggplot(tdf.norm.induced) + geom_smooth(aes(x=distance_from_TSS,y=depth_sum,color=group,group=sample)) + ggtitle(paste(n.repressed,' Repressed EWS-FLI1 Targets Normalized')) + xlim(c(-750,200))
+
+# xlim -750,200
+g %+% tdf.norm.repressed + ggtitle(paste(n.repressed,' Repressed EWS-FLI1 Targets Normalized')) + coord_cartesian(xlim=c(-750,200)) # + xlim(c(-2000,2000)) #
+
+g %+% tdf.norm.induced + ggtitle(paste(n.induced,' Induced EWS-FLI1 Targets Normalized'))  + coord_cartesian(xlim=c(-750,200))
+
+
+# xlim -2000,5000
+g %+% tdf.norm.repressed + ggtitle(paste(n.repressed,' Repressed EWS-FLI1 Targets Normalized')) + coord_cartesian(xlim=c(-2000,5000)) # + xlim(c(-2000,2000)) #
+g %+% tdf.norm.induced + ggtitle(paste(n.induced,' Induced EWS-FLI1 Targets Normalized'))  + coord_cartesian(xlim=c(-2000,5000))
+```
+
+<!-- # Induced Genes -->
+
+```{r Induced_depth_data_for_INDIVIDUAL_figures,eval=FALSE}
+
+for(gene in induced){
+  # get tidy normalized induced
+  x=dplyr::filter(norm.df,ext_gene==gene)
+  tn = tidyr::gather(x,sample,depth,-genome_position,-distance_from_TSS,-ext_gene)
+  tn = tn %>% group_by(distance_from_TSS,sample) %>% summarize(depth_sum=sum(depth))
+  tn = left_join(tn,meta,by='sample')
+  
+  print(
+    ggplot(tn) + geom_line(aes(x=distance_from_TSS,y=depth_sum,color=group,group=sample)) + ggtitle(paste(gene,' - an Induced EWS-FLI1 Target')) + xlim(c(-750,200)) + ylab('proportion of reads')
+  )
+}
+
+```
+
+<!-- # Repressed Genes -->
+
+```{r Repressed_depth_data_for_INDIVIDUAL_figures,eval=FALSE}
+  # get tidy normalized repressed
+for(gene in repressed){
+  # get tidy normalized induced
+  x=dplyr::filter(norm.df,ext_gene==gene)
+  tn = tidyr::gather(x,sample,depth,-genome_position,-distance_from_TSS,-ext_gene)
+  tn = tn %>% group_by(distance_from_TSS,sample) %>% summarize(depth_sum=sum(depth))
+  tn = left_join(tn,meta,by='sample')
+  
+  print(
+    ggplot(tn) + geom_line(aes(x=distance_from_TSS,y=depth_sum,color=group,group=sample)) + ggtitle(paste(gene,' - a Repressed EWS-FLI1 Target')) + xlim(c(-750,200)) + ylab('proportion of reads')
+  )
+}
+```
+
+
+# EWS-FLI1 Induced Repressed - Library-size Normalized
+
+```{r lib.norm.prep_InducedRepressed_depth_data_for_figures}
+
+# get the data and manually add sample names:
+# .df = read.delim('induced_repressed_depth.txt',sep='\t',header=FALSE,stringsAsFactors = FALSE)
+.df = read.delim('induced_repressed_depth_updated.txt',sep='\t',header=FALSE,stringsAsFactors = FALSE)
+colnames(.df)=c('ext_gene','genome_position','distance_from_TSS','GFGRO100A',	'GFGRO100B',	'GFGRO100C',	'GFGRO20A',	'GFGRO20B',	'GFGROPHAA',	'GFGROComA',	'GFGROComB',	'GFGROComC',	'GFGRO20C',	'GFGROPHAB',	'GFGROPHAC',	'GFGROSolA',	'GFGROSolB',	'GFGROSolC')
+n.targets = length(unique(.df$ext_gene))
+
+# get normalized to total reads mapped dataset
+# norm.df = data.frame(t(apply(.df[,4:18], 1, "/", colSums(.df[,4:18],na.rm=TRUE))))
+
+## Library size normalize:
+mapstat$sample==colnames(.df)
+mapstat$sample[order(match(mapstat$sample,colnames(.df)[4:18]))]==colnames(.df)[4:18]
+scaling.factor = mapstat$UniquelyMappingReads[order(match(mapstat$sample,colnames(.df)[4:18]))]
+scaling.factor = scaling.factor/2e7 # 
+norm.df = data.frame(t(apply(.df[,4:18], 1, "/",scaling.factor)))
+
+norm.df = cbind(.df[,1:3],norm.df)
+colnames(norm.df)=c('ext_gene','genome_position','distance_from_TSS',
+                    'GFGRO100A', 'GFGRO100B',	'GFGRO100C', # sample order messed up because
+                    'GFGRO20A',	'GFGRO20B',	  'GFGROPHAA',	# samples were initially switched.
+                    'GFGROComA',	'GFGROComB',	'GFGROComC',	
+                    'GFGRO20C',	'GFGROPHAB',	'GFGROPHAC',	
+                    'GFGROSolA',	'GFGROSolB',	'GFGROSolC')
+
+
+
+### Get induced / repressed lists:
+induced.genes = readxl::read_excel('/Volumes/projects_secondary/bbc/research/GROP_20190515_GroSeq/deliverables/EWS-FLI1 Induced & Repressed BESTLISTS.xlsx',sheet='Induced')
+repressed.genes = readxl::read_excel('/Volumes/projects_secondary/bbc/research/GROP_20190515_GroSeq/deliverables/EWS-FLI1 Induced & Repressed BESTLISTS.xlsx',sheet='Repressed')
+
+induced = induced.genes$ext_gene
+repressed = repressed.genes$ext_gene
+# which(repressed %in% norm.df$ext_gene)
+
+# get tidy normalized induced
+norm.induced=dplyr::filter(norm.df,ext_gene %in% induced)
+n.induced=length(unique(norm.induced$ext_gene))
+tdf.norm.induced = tidyr::gather(norm.induced,sample,depth,-genome_position,-distance_from_TSS,-ext_gene)
+tdf.norm.induced = tdf.norm.induced %>% group_by(distance_from_TSS,sample) %>% summarize(depth_sum=sum(depth))
+tdf.norm.induced = left_join(tdf.norm.induced,meta,by='sample')
+
+# get tidy normalized repressed
+norm.repressed=dplyr::filter(norm.df,ext_gene %in% repressed)
+n.repressed=length(unique(norm.repressed$ext_gene)) # 5, RMS3 not found
+tdf.norm.repressed = tidyr::gather(norm.repressed,sample,depth,-genome_position,-distance_from_TSS,-ext_gene)
+tdf.norm.repressed = tdf.norm.repressed %>% group_by(distance_from_TSS,sample) %>% summarize(depth_sum=sum(depth))
+tdf.norm.repressed = left_join(tdf.norm.repressed,meta,by='sample')
+
+```
+
+```{r EWS-FLI1_InducedRepressed.libsizenorm }
+
+# Repressed
+g = ggplot(tdf.norm.repressed) + geom_line(aes(x=distance_from_TSS,y=depth_sum,color=group,group=sample)) + ggtitle(paste(n.repressed,' Repressed EWS-FLI1 Targets')) + xlim(c(-50000,200000)) + 
+  ylab('Library-size Normalized Reads')
+g
+g %+% tdf.norm.induced + ggtitle(paste(n.induced,' Induced EWS-FLI1 Targets'))
+
+#
+# ggplot(tdf.norm.induced) + geom_smooth(aes(x=distance_from_TSS,y=depth_sum,color=group,group=sample)) + ggtitle(paste(n.repressed,' Repressed EWS-FLI1 Targets Normalized')) + xlim(c(-750,200))
+
+# xlim -750,200
+g %+% tdf.norm.repressed + ggtitle(paste(n.repressed,' Repressed EWS-FLI1 Targets')) + coord_cartesian(xlim=c(-750,200)) # + xlim(c(-2000,2000)) #
+
+g %+% tdf.norm.induced + ggtitle(paste(n.induced,' Induced EWS-FLI1 Targets'))  + coord_cartesian(xlim=c(-750,200))
+
+
+# xlim -2000,5000
+g %+% tdf.norm.repressed + ggtitle(paste(n.repressed,' Repressed EWS-FLI1 Targets')) + coord_cartesian(xlim=c(-2000,5000)) # + xlim(c(-2000,2000)) #
+g %+% tdf.norm.induced + ggtitle(paste(n.induced,' Induced EWS-FLI1 Targets'))  + coord_cartesian(xlim=c(-2000,5000))
+```
+
+```{r EWS-FLI1_InducedRepressed.libsizenorm.highwaycurve }
+
+# Repressed
+g = ggplot(tdf.norm.repressed) + geom_smooth(aes(x=distance_from_TSS,y=depth_sum,color=group,group=sample)) + ggtitle(paste(n.repressed,' Repressed EWS-FLI1 Targets')) + xlim(c(-50000,200000)) + 
+  ylab('Library-size Normalized Reads')
+g
+g %+% tdf.norm.induced + ggtitle(paste(n.induced,' Induced EWS-FLI1 Targets'))
+
+#
+# ggplot(tdf.norm.induced) + geom_smooth(aes(x=distance_from_TSS,y=depth_sum,color=group,group=sample)) + ggtitle(paste(n.repressed,' Repressed EWS-FLI1 Targets Normalized')) + xlim(c(-750,200))
+
+# xlim -750,200
+g %+% tdf.norm.repressed + ggtitle(paste(n.repressed,' Repressed EWS-FLI1 Targets')) + coord_cartesian(xlim=c(-750,200)) # + xlim(c(-2000,2000)) #
+
+g %+% tdf.norm.induced + ggtitle(paste(n.induced,' Induced EWS-FLI1 Targets'))  + coord_cartesian(xlim=c(-750,200))
+
+
+# xlim -2000,5000
+g %+% tdf.norm.repressed + ggtitle(paste(n.repressed,' Repressed EWS-FLI1 Targets')) + coord_cartesian(xlim=c(-2000,5000)) # + xlim(c(-2000,2000)) #
+g %+% tdf.norm.induced + ggtitle(paste(n.induced,' Induced EWS-FLI1 Targets'))  + coord_cartesian(xlim=c(-2000,5000))
+```
+
+```{r EWS-FLI1_InducedRepressed.libsizenorm.highwaycurve2 }
+
+g %+% tdf.norm.repressed + ggtitle(paste(n.repressed,' Repressed EWS-FLI1 Targets')) + coord_cartesian(xlim=c(-25000,200000)) # + xlim(c(-2000,2000)) #
+g %+% tdf.norm.induced + ggtitle(paste(n.induced,' Induced EWS-FLI1 Targets'))  + coord_cartesian(xlim=c(-25000,200000))
+
+```
+
+## Indv. Induced Genes
+
+```{r Induced_depth_data_for_INDIVIDUAL_figures.libsizenorm,eval=FALSE}
+
+for(gene in induced){
+  # get tidy normalized induced
+  x=dplyr::filter(norm.df,ext_gene==gene)
+  tn = tidyr::gather(x,sample,depth,-genome_position,-distance_from_TSS,-ext_gene)
+  tn = tn %>% group_by(distance_from_TSS,sample) %>% summarize(depth_sum=sum(depth))
+  tn = left_join(tn,meta,by='sample')
+  
+  print(
+    ggplot(tn) + geom_line(aes(x=distance_from_TSS,y=depth_sum,color=group,group=sample)) + ggtitle(paste(gene,' - an Induced EWS-FLI1 Target')) + xlim(c(-750,200)) + ylab('Library-size Normalized Reads')
+  )
+}
+
+```
+
+## Indv. Repressed Genes
+
+```{r Repressed_depth_data_for_INDIVIDUAL_figures.libsizenorm,eval=FALSE}
+  # get tidy normalized repressed
+for(gene in repressed){
+  # get tidy normalized induced
+  x=dplyr::filter(norm.df,ext_gene==gene)
+  tn = tidyr::gather(x,sample,depth,-genome_position,-distance_from_TSS,-ext_gene)
+  tn = tn %>% group_by(distance_from_TSS,sample) %>% summarize(depth_sum=sum(depth))
+  tn = left_join(tn,meta,by='sample')
+  
+  print(
+    ggplot(tn) + geom_line(aes(x=distance_from_TSS,y=depth_sum,color=group,group=sample)) + ggtitle(paste(gene,' - a Repressed EWS-FLI1 Target')) + xlim(c(-750,200)) + ylab('Library-size Normalized Reads')
+  )
+}
+```
+
+# RNAseq Induced Genes
+
+```{r lib.norm.prep_BestInducedRepressedSubsets}
+
+# induced = induced.genes$ext_gene
+# repressed = repressed.genes$ext_gene
+rnaseq.induced.1 = c('PADI2', 'RUNX3', 'JAK1', 'PTGER3', 'HIPK1', 'UAP1', 'RGL1', 'LAMB3', 'KMO', 'ID2')
+rnaseq.induced.2 = c('FCGRT', 'SLC17A7', 'AHCY', 'NKX2-2', 'GLG1', 'CDH11', 'GLCE', 'RCOR1',
+'FLRT2', 'PCDH17')
+cat('rnaseq.induced.1:',length(rnaseq.induced.1),'genes\n')
+cat(paste(rnaseq.induced.1,collapse='\n'))
+cat('rnaseq.induced.2:',length(rnaseq.induced.2),'genes\n')
+cat(paste(rnaseq.induced.2,collapse='\n'))
+
+# cat('rnaseq.induced.1 genes in induced.genes:\n',paste(rnaseq.induced.1[which(rnaseq.induced.1 %in% induced.genes$ext_gene)],collapse='\n'))
+# cat('rnaseq.induced.1 genes in repressed.genes:\n',paste(rnaseq.induced.1[which(rnaseq.induced.1 %in% repressed.genes$ext_gene)],collapse='\n'))
+# cat('rnaseq.induced.1 genes NOT found:\n',paste(rnaseq.induced.1[which(! rnaseq.induced.1 %in% c(repressed.genes$ext_gene,induced.genes$ext_gene))],collapse='\n'))
+# 
+# cat('rnaseq.induced.2 genes in induced.genes:\n',paste(rnaseq.induced.2[which(rnaseq.induced.2 %in% induced.genes$ext_gene)],collapse='\n'))
+# cat('rnaseq.induced.2 genes in repressed.genes:\n',paste(rnaseq.induced.2[which(rnaseq.induced.2 %in% repressed.genes$ext_gene)],collapse='\n'))
+# cat('rnaseq.induced.2 genes NOT found:\n',paste(rnaseq.induced.2[which(! rnaseq.induced.2 %in% c(repressed.genes$ext_gene,induced.genes$ext_gene))],collapse='\n'))
+
+# length(which(rnaseq.induced.2 %in% induced.genes$ext_gene))
+# length(which(rnaseq.induced.1 %in% repressed.genes$ext_gene))
+# length(which(rnaseq.induced.2 %in% repressed.genes$ext_gene))
+# which(repressed %in% norm.df$ext_gene)
+
+# get tidy normalized induced for rnaseq.induced.1
+rnaseq.induced.norm=dplyr::filter(norm.df,ext_gene %in% rnaseq.induced.1)
+n.rnaseq.induced.1=length(unique(rnaseq.induced.norm$ext_gene))
+cat('Found',n.rnaseq.induced.1,'rnaseq.induced.1 genes in the normalized data:\n')
+tdf.rnaseq.induced.norm = tidyr::gather(rnaseq.induced.norm,sample,depth,-genome_position,-distance_from_TSS,-ext_gene)
+tdf.rnaseq.induced.norm = tdf.rnaseq.induced.norm %>% group_by(distance_from_TSS,sample) %>% summarize(depth_sum=sum(depth))
+tdf.rnaseq.induced.norm.1 = left_join(tdf.rnaseq.induced.norm,meta,by='sample')
+
+# get tidy normalized induced for rnaseq.induced.2 - all variables duplicated except n.rnaseq.induced.2 and tdf.rnaseq.induced.norm.2
+rnaseq.induced.norm=dplyr::filter(norm.df,ext_gene %in% rnaseq.induced.2)
+n.rnaseq.induced.2=length(unique(rnaseq.induced.norm$ext_gene))
+cat('Found',n.rnaseq.induced.1,'rnaseq.induced.2 genes in the normalized data:\n')
+tdf.rnaseq.induced.norm = tidyr::gather(rnaseq.induced.norm,sample,depth,-genome_position,-distance_from_TSS,-ext_gene)
+tdf.rnaseq.induced.norm = tdf.rnaseq.induced.norm %>% group_by(distance_from_TSS,sample) %>% summarize(depth_sum=sum(depth))
+tdf.rnaseq.induced.norm.2 = left_join(tdf.rnaseq.induced.norm,meta,by='sample')
+
+
+```
+
+## Induced.genes.1
+
+```{r RNAseq.Induced.genes.1.libsizenorm }
+
+# Repressed
+g = ggplot(tdf.rnaseq.induced.norm.1) + geom_line(aes(x=distance_from_TSS,y=depth_sum,color=group,group=sample)) + ggtitle(paste(n.rnaseq.induced.1,' Induced RNAseq Genes 1')) + xlim(c(-50000,200000)) + 
+  ylab('Library-size Normalized Reads')
+g
+
+g + coord_cartesian(xlim=c(-2000,5000))
+
+g + coord_cartesian(xlim=c(-750,200))
+
+
+```
+
+```{r RNAseq.Induced.genes.1.libsizenorm.highwaycurve,eval=FALSE }
+
+# Repressed
+g = ggplot(tdf.rnaseq.induced.norm.1) + geom_smooth(aes(x=distance_from_TSS,y=depth_sum,color=group,group=sample)) + ggtitle(paste(n.rnaseq.induced.1,' Induced RNAseq Genes 1')) + xlim(c(-50000,200000)) + ylab('Library-size Normalized Reads')
+
+g
+
+g + xlim=c(-2000,5000)
+
+g + coord_cartesian(xlim=c(-2000,5000))
+
+g + coord_cartesian(xlim=c(-750,200))
+
+```
+
+## Induced.genes.2
+
+```{r RNAseq.Induced.genes.2.libsizenorm }
+
+# Repressed
+g = ggplot(tdf.rnaseq.induced.norm.2) + geom_line(aes(x=distance_from_TSS,y=depth_sum,color=group,group=sample)) + ggtitle(paste(n.rnaseq.induced.2,' Induced RNAseq Genes 2')) + xlim(c(-50000,200000)) + 
+  ylab('Library-size Normalized Reads')
+g
+
+g + coord_cartesian(xlim=c(-2000,5000))
+
+g + coord_cartesian(xlim=c(-750,200))
+
+
+```
+
+```{r RNAseq.Induced.genes.2.libsizenorm.highwaycurve,eval=FALSE }
+
+# Repressed
+g = ggplot(tdf.rnaseq.induced.norm.2) + geom_smooth(aes(x=distance_from_TSS,y=depth_sum,color=group,group=sample)) + ggtitle(paste(n.rnaseq.induced.2,' Induced RNAseq Genes 2')) + xlim(c(-50000,200000)) + 
+  ylab('Library-size Normalized Reads')
+g
+
+g + xlim=c(-2000,5000)
+
+g + coord_cartesian(xlim=c(-2000,5000))
+
+g + coord_cartesian(xlim=c(-750,200))
+
+```
+
+```{r save.image}
+
+
+save.image('GROP_20190515_GroSeq.Rdata')
+
+
+```
